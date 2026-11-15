@@ -86,6 +86,31 @@ describe("ZetaClient", () => {
     expect(n).toBe(3); // me -> refresh -> me
   });
 
+  test("sendMessageStream retries once on 401 after refresh", async () => {
+    let n = 0;
+    const fetchFn = (async (url: unknown) => {
+      n += 1;
+      if (String(url).endsWith("/v1/auth/tokens")) {
+        return new Response(JSON.stringify({ newAccessToken: "t2", newRefreshToken: "r2" }), { status: 200 });
+      }
+      if (n === 1) return new Response(JSON.stringify({ code: "AUTH_EXPIRED" }), { status: 401 });
+      const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"chunkMessage":{"contents":[{"text":"hi"}]}}\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }) as unknown as typeof fetch;
+    const client = new ZetaClient({ fetch: fetchFn });
+    client.setTokens({ accessToken: "t1", refreshToken: "r1" });
+    const chunks = [];
+    for await (const ch of client.sendMessageStream("r1", { kind: "text", text: "hi" })) chunks.push(ch);
+    expect(chunks).toHaveLength(1);
+    expect(n).toBe(3); // stream -> refresh -> stream
+    expect(client.token).toBe("t2");
+  });
+
   test("sendMessageStream parses SSE events split on blank lines", async () => {
     const stream = new ReadableStream<Uint8Array>({
       start(c) {

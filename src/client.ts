@@ -222,6 +222,7 @@ export class ZetaClient {
     path: string,
     body: unknown,
     signal?: AbortSignal,
+    retried = false,
   ): Promise<Response> {
     if (this.tokenExpiringSoon()) await this.refreshAccessToken().catch(() => undefined);
     const res = await this.doFetch(`${this.baseUrl}${path}`, {
@@ -230,6 +231,14 @@ export class ZetaClient {
       body: JSON.stringify(body),
       signal,
     });
+    if (res.status === 401 && this.refreshToken && !retried) {
+      try {
+        await this.refreshAccessToken();
+      } catch {
+        // fall through to the 401 error below
+      }
+      if (this.accessToken) return this.streamRequest(path, body, signal, true);
+    }
     if (!res.ok) throw new ZetaError(`zeta ${res.status}: ${path}`, res.status, await res.text().catch(() => ""));
     return res;
   }
