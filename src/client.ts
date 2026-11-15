@@ -1,0 +1,473 @@
+import { readFile, writeFile } from "node:fs/promises";
+import { ZetaError } from "./errors.ts";
+import { parseStreamChunks } from "./stream.ts";
+import type {
+  ChatStreamChunk,
+  CreateRoomRequest,
+  DetailedPlotApiDto,
+  ExternalToken,
+  JsonRecord,
+  ListMessageResponse,
+  ListRoomsResponse,
+  PagePlotResponse,
+  PageQuery,
+  PlotApiDto,
+  RegenerateMessageRequest,
+  RoomApiDto,
+  SendMessagePayload,
+  Tokens,
+  UpdateMessageRequest,
+  UserApiDto,
+  UserMeResponse,
+  ZetaClientOptions,
+} from "./types.ts";
+import { buildSendMessageBody } from "./types.ts";
+
+export const DEFAULT_BASE_URL = "https://api.zeta-ai.io";
+export const DEFAULT_CLIENT_VERSION = "3.51.94";
+/** Web sends the version name here, not VERSION_CODE (359 was rejected with APP_UPDATE_REQUIRED). */
+export const DEFAULT_NATIVE_VERSION = "3.51.94";
+/** BuildConfig SUPPORT_URL — SSO redirect target. */
+export const SUPPORT_URL = "https://support.zeta-ai.io/zeta";
+
+/** `<SUPPORT_URL>/sso?code=<code>&to=<path>` (module_6653:39-44). */
+export function buildSsoRedirectUrl(code: string, to = "/"): string {
+  const q = new URLSearchParams({ code });
+  if (to) q.set("to", to);
+  return `${SUPPORT_URL}/sso?${q.toString()}`;
+}
+
+function parseTokens(body: unknown): Tokens | null {
+  const src = (body as { data?: unknown })?.data ?? body;
+  const t = src as { accessToken?: unknown; refreshToken?: unknown; newAccessToken?: unknown; newRefreshToken?: unknown };
+  const accessToken = t.newAccessToken ?? t.accessToken;
+  const refreshToken = t.newRefreshToken ?? t.refreshToken;
+  if (typeof accessToken !== "string" || !accessToken) return null;
+  return { accessToken, refreshToken: typeof refreshToken === "string" ? refreshToken : "" };
+}
+
+/** linejs-style factory: `const client = loginWithAccessToken(token)`. */
+export function loginWithAccessToken(
+  accessToken: string,
+  options: Omit<ZetaClientOptions, "accessToken"> = {},
+): ZetaClient {
+  return new ZetaClient({ ...options, accessToken });
+}
+
+export async function saveTokens(path: string, tokens: Tokens): Promise<void> {
+  await writeFile(path, JSON.stringify(tokens), { mode: 0o600 });
+}
+
+export async function loadTokens(path: string): Promise<Tokens | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (typeof parsed === "object" && parsed !== null && typeof (parsed as Tokens).accessToken === "string") {
+      return parsed as Tokens;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function decodeJwtExp(token: string): number | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const json: unknown = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+    return typeof (json as { exp?: unknown }).exp === "number" ? (json as { exp: number }).exp : null;
+  } catch {
+    return null;
+  }
+}
+
+function toQuery(query: Record<string, unknown>): Record<string, string> {
+  const q: Record<string, string> = {};
+  for (const [k, v] of Object.entries(query)) if (v !== undefined) q[k] = String(v);
+  return q;
+}
+
+export class ZetaClient {
+  private readonly baseUrl: string;
+  private readonly apiKey: string | undefined;
+  private readonly extraHeaders: Record<string, string>;
+  private readonly doFetch: typeof fetch;
+  private readonly onTokensRefreshed: ZetaClientOptions["onTokensRefreshed"];
+  private readonly clientVersion: string;
+  private readonly nativeVersion: string;
+  private readonly language: string | undefined;
+  readonly deviceId: string;
+  private accessToken: string | undefined;
+  private refreshToken: string | undefined;
+  private refreshing: Promise<void> | null = null;
+
+  constructor(options: ZetaClientOptions = {}) {
+    this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, "");
+    this.accessToken = options.accessToken;
+    this.refreshToken = options.refreshToken;
+    this.deviceId = options.deviceId ?? crypto.randomUUID();
+    this.apiKey = options.apiKey;
+    this.extraHeaders = options.extraHeaders ?? {};
+    this.doFetch = options.fetch ?? fetch;
+    this.onTokensRefreshed = options.onTokensRefreshed;
+    this.clientVersion = options.clientVersion ?? DEFAULT_CLIENT_VERSION;
+    this.nativeVersion = options.nativeVersion ?? DEFAULT_NATIVE_VERSION;
+    this.language = options.language;
+  }
+
+  get token(): string | undefined {
+    return this.accessToken;
+  }
+
+  setTokens(tokens: Tokens): void {
+    this.accessToken = tokens.accessToken;
+    this.refreshToken = tokens.refreshToken;
+  }
+
+  setAccessToken(token: string): void {
+    this.accessToken = token;
+  }
+
+  /** Headers the app sends (fn51718/fn52394). */
+  private headers(): Record<string, string> {
+    const h: Record<string, string> = {
+      Accept: "application/json",
+      "X-Client-Type": "app",
+      "X-Device-Type": "android",
+      "X-Client-Version": this.clientVersion,
+      "X-Client-Native-Version": this.nativeVersion,
+      "X-Sticky": this.deviceId,
+      ...this.extraHeaders,
+    };
+    if (this.language) h["X-User-Language"] = this.language;
+    if (this.accessToken) h.Authorization = `Bearer ${this.accessToken}`;
+    if (this.apiKey) h["x-api-key"] = this.apiKey;
+    return h;
+  }
+
+  /** App rule (fn52394): refresh when jwt exp is within 30s. */
+  private tokenExpiringSoon(): boolean {
+    if (!this.accessToken || !this.refreshToken) return false;
+    const exp = decodeJwtExp(this.accessToken);
+    return exp !== null && exp * 1000 - 30_000 < Date.now();
+  }
+
+  /** POST /v1/auth/tokens {deviceId, type:"refresh", refreshToken} (fn52882). */
+  async refreshAccessToken(): Promise<Tokens> {
+    if (!this.refreshToken) throw new ZetaError("no refresh token stored", 0);
+    if (!this.refreshing) {
+      this.refreshing = (async () => {
+        const res = await this.doFetch(`${this.baseUrl}/v1/auth/tokens`, {
+          method: "POST",
+          headers: { ...this.headers(), "Content-Type": "application/json" },
+          body: JSON.stringify({ deviceId: this.deviceId, type: "refresh", refreshToken: this.refreshToken }),
+        });
+        if (!res.ok) throw new ZetaError(`zeta ${res.status}: refresh`, res.status, await res.text().catch(() => ""));
+        const tokens = parseTokens(await res.json());
+        if (!tokens) throw new ZetaError("refresh returned no access token", res.status);
+        this.setTokens(tokens);
+        this.onTokensRefreshed?.(tokens);
+      })().finally(() => {
+        this.refreshing = null;
+      });
+    }
+    await this.refreshing;
+    return { accessToken: this.accessToken ?? "", refreshToken: this.refreshToken ?? "" };
+  }
+
+  private async request<T>(
+    path: string,
+    init: { method?: string; body?: unknown; query?: Record<string, string>; signal?: AbortSignal } = {},
+    retried = false,
+  ): Promise<T> {
+    if (this.tokenExpiringSoon()) await this.refreshAccessToken().catch(() => undefined);
+    const url = new URL(this.baseUrl + path);
+    for (const [k, v] of Object.entries(init.query ?? {})) url.searchParams.set(k, v);
+    let res: Response;
+    try {
+      res = await this.doFetch(url, {
+        method: init.method ?? "GET",
+        headers: { ...this.headers(), ...(init.body !== undefined ? { "Content-Type": "application/json" } : {}) },
+        body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
+        signal: init.signal,
+      });
+    } catch (cause) {
+      throw new ZetaError(`request failed: ${path}`, 0, String(cause));
+    }
+    if (res.status === 401 && this.refreshToken && !retried) {
+      try {
+        await this.refreshAccessToken();
+      } catch {
+        // fall through to the 401 error below
+      }
+      if (this.accessToken) return this.request<T>(path, init, true);
+    }
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      let code: string | undefined;
+      try {
+        const parsed: unknown = JSON.parse(body);
+        const c = (parsed as { code?: unknown; exceptionCode?: unknown }).code ?? (parsed as { exceptionCode?: unknown }).exceptionCode;
+        if (typeof c === "string") code = c;
+      } catch {
+        // non-JSON error body: keep code undefined
+      }
+      throw new ZetaError(`zeta ${res.status}: ${path}`, res.status, body, code);
+    }
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
+  }
+
+  private async streamRequest(
+    path: string,
+    body: unknown,
+    signal?: AbortSignal,
+  ): Promise<Response> {
+    if (this.tokenExpiringSoon()) await this.refreshAccessToken().catch(() => undefined);
+    const res = await this.doFetch(`${this.baseUrl}${path}`, {
+      method: "POST",
+      headers: { ...this.headers(), Accept: "text/event-stream", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) throw new ZetaError(`zeta ${res.status}: ${path}`, res.status, await res.text().catch(() => ""));
+    return res;
+  }
+
+  /** POST /v1/auth/tokens {deviceId, type:"external", externalToken} (module_4161:212).
+   * Google: token = idToken; Apple: token = identityToken, name = given+family.
+   * On 404 the app calls checkSignup. */
+  async loginWithExternalToken(externalToken: ExternalToken, signal?: AbortSignal): Promise<Tokens> {
+    const res = await this.request<JsonRecord>("/v1/auth/tokens", {
+      method: "POST",
+      body: { deviceId: this.deviceId, type: "external", externalToken },
+      signal,
+    });
+    const tokens = parseTokens(res);
+    if (!tokens) throw new ZetaError("login returned no access token", 0);
+    this.setTokens(tokens);
+    return tokens;
+  }
+
+  /** POST /v1/users/check {externalToken} — called when external login 404s. */
+  checkSignup(externalToken: ExternalToken, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/users/check", { method: "POST", body: { externalToken }, signal });
+  }
+
+  /** Internal/debug login (InternalLoginScreen). Experimental — not the normal user login. */
+  async loginInternal(username: string, password: string, signal?: AbortSignal): Promise<Tokens> {
+    const res = await this.request<JsonRecord>("/v1/auth/tokens", {
+      method: "POST",
+      body: { type: "internal", deviceId: this.deviceId, username, password },
+      signal,
+    });
+    const tokens = parseTokens(res);
+    if (!tokens) throw new ZetaError("login returned no access token", 0);
+    this.setTokens(tokens);
+    return tokens;
+  }
+
+  /** POST /v1/auth/tokens → TokenApiDto. Body shape unknown beyond login/refresh. */
+  issueToken(body: JsonRecord, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/auth/tokens", { method: "POST", body, signal });
+  }
+  /** POST /v1/auth/sso/code → {code}. The app calls it with {} (module_6653). */
+  generateSsoCode(body: JsonRecord = {}, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/auth/sso/code", { method: "POST", body, signal });
+  }
+  /** POST /v1/auth/tokens/sso-access-token → SsoAccessTokenApiDto. Body unknown. */
+  exchangeSsoAccessToken(body: JsonRecord, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/auth/tokens/sso-access-token", { method: "POST", body, signal });
+  }
+  getConnectedExternalPlatforms(signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/auth/connected-external-platforms", { signal });
+  }
+
+  getMe(signal?: AbortSignal): Promise<UserMeResponse> {
+    return this.request<UserMeResponse>("/v1/users/me", { signal });
+  }
+  updateMe(body: JsonRecord, signal?: AbortSignal): Promise<UserMeResponse> {
+    return this.request<UserMeResponse>("/v1/users/me", { method: "PATCH", body, signal });
+  }
+  getUser(userId: string, signal?: AbortSignal): Promise<UserApiDto> {
+    return this.request<UserApiDto>(`/v1/users/${encodeURIComponent(userId)}`, { signal });
+  }
+  getUserIdByUsername(username: string, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/users/get-id-by-username/${encodeURIComponent(username)}`, { signal });
+  }
+  logout(signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/users/logout", { method: "POST", signal });
+  }
+  reportUser(userId: string, body: JsonRecord = {}, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/users/${encodeURIComponent(userId)}/report`, { method: "POST", body, signal });
+  }
+
+  listRooms(query: PageQuery = {}, signal?: AbortSignal): Promise<ListRoomsResponse> {
+    return this.request<ListRoomsResponse>("/v1/rooms", { query: toQuery(query), signal });
+  }
+  /** First call sends no page param, then page = previous nextPage until null. */
+  async listAllRooms(signal?: AbortSignal): Promise<RoomApiDto[]> {
+    const all: RoomApiDto[] = [];
+    let page: number | string | undefined;
+    for (;;) {
+      const res = await this.listRooms(page === undefined ? {} : { page }, signal);
+      all.push(...(res.rooms ?? []));
+      const next = (res as { nextPage?: unknown }).nextPage;
+      if (next === null || next === undefined) break;
+      page = next as number | string;
+    }
+    return all;
+  }
+  getRoom(roomId: string, signal?: AbortSignal): Promise<RoomApiDto> {
+    return this.request<RoomApiDto>(`/v1/rooms/${encodeURIComponent(roomId)}`, { signal });
+  }
+  createRoom(body: CreateRoomRequest, signal?: AbortSignal): Promise<RoomApiDto> {
+    return this.request<RoomApiDto>("/v1/rooms", { method: "POST", body, signal });
+  }
+  updateRoom(roomId: string, body: JsonRecord, signal?: AbortSignal): Promise<RoomApiDto> {
+    return this.request<RoomApiDto>(`/v1/rooms/${encodeURIComponent(roomId)}`, { method: "PUT", body, signal });
+  }
+  deleteRoom(roomId: string, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/rooms/${encodeURIComponent(roomId)}`, { method: "DELETE", signal });
+  }
+  pinRoom(roomId: string, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/rooms/${encodeURIComponent(roomId)}/pin`, { method: "POST", signal });
+  }
+  unpinRoom(roomId: string, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/rooms/${encodeURIComponent(roomId)}/pin`, { method: "DELETE", signal });
+  }
+  cloneRoom(roomId: string, signal?: AbortSignal): Promise<RoomApiDto> {
+    return this.request<RoomApiDto>(`/v1/rooms/${encodeURIComponent(roomId)}/clone`, { method: "POST", signal });
+  }
+  purgeRooms(signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/rooms/purge", { method: "POST", signal });
+  }
+  getActiveRoomId(signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/rooms/active-room-id", { signal });
+  }
+  getRoomPlotId(roomId: string, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/rooms/${encodeURIComponent(roomId)}/plot-id`, { signal });
+  }
+
+  listMessages(
+    roomId: string,
+    query: { limit?: number | string; cursor?: string; prevCursor?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<ListMessageResponse> {
+    return this.request<ListMessageResponse>(`/v1/rooms/${encodeURIComponent(roomId)}/messages`, { query: toQuery(query), signal });
+  }
+  updateMessage(roomId: string, messageId: string, body: UpdateMessageRequest, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`, { method: "PUT", body, signal });
+  }
+  confirmCandidate(roomId: string, messageId: string, candidateId: string, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.updateMessage(roomId, messageId, { type: "CANDIDATE", candidateId }, signal);
+  }
+  editCandidate(
+    roomId: string,
+    messageId: string,
+    candidateId: string,
+    body: { requestId: string; text: string },
+    signal?: AbortSignal,
+  ): Promise<JsonRecord> {
+    return this.request<JsonRecord>(
+      `/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}/candidates/${encodeURIComponent(candidateId)}`,
+      { method: "PUT", body, signal },
+    );
+  }
+  deleteRoomMessages(roomId: string, body: JsonRecord = {}, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/rooms/${encodeURIComponent(roomId)}/room-messages`, { method: "DELETE", body, signal });
+  }
+
+  listPlots(query: PageQuery = {}, signal?: AbortSignal): Promise<PagePlotResponse> {
+    return this.request<PagePlotResponse>("/v1/plots", { query: toQuery(query), signal });
+  }
+  async listAllPlots(signal?: AbortSignal): Promise<PlotApiDto[]> {
+    const all: PlotApiDto[] = [];
+    let page: number | string | undefined;
+    for (;;) {
+      const res = await this.listPlots(page === undefined ? {} : { page }, signal);
+      all.push(...(res.plots ?? []));
+      const next = (res as { nextPage?: unknown }).nextPage;
+      if (next === null || next === undefined) break;
+      page = next as number | string;
+    }
+    return all;
+  }
+  getPlot(plotId: string, signal?: AbortSignal): Promise<DetailedPlotApiDto> {
+    return this.request<DetailedPlotApiDto>(`/v1/plots/${encodeURIComponent(plotId)}`, { signal });
+  }
+  createPlot(body: JsonRecord, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/plots", { method: "POST", body, signal });
+  }
+  updatePlot(plotId: string, body: JsonRecord, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/plots/${encodeURIComponent(plotId)}`, { method: "PATCH", body, signal });
+  }
+  searchPlots(query: string, signal?: AbortSignal): Promise<PagePlotResponse> {
+    return this.request<PagePlotResponse>("/v1/plots/search/autocomplete", { query: { query }, signal });
+  }
+
+  searchCreators(query: string, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/creators/search/autocomplete", { query: { query }, signal });
+  }
+  getCreatorStats(creatorId: string, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/creators/${encodeURIComponent(creatorId)}/stats`, { signal });
+  }
+  listNotifications(query: Record<string, string> = {}, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/notifications", { query, signal });
+  }
+  listChatProfiles(signal?: AbortSignal): Promise<JsonRecord[]> {
+    return this.request<JsonRecord[]>("/v1/user-chat-profiles", { signal });
+  }
+  getCoinBalance(signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/coin/balance", { signal });
+  }
+
+  /** POST /v1/plots/:plotId/reports (module_3865). */
+  createPlotReport(plotId: string, body: JsonRecord = {}, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/plots/${encodeURIComponent(plotId)}/reports`, { method: "POST", body, signal });
+  }
+  /** POST /v1/lorebooks/:lorebookId/reports (module_3981). */
+  createLorebookReport(lorebookId: string, body: JsonRecord = {}, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/lorebooks/${encodeURIComponent(lorebookId)}/reports`, { method: "POST", body, signal });
+  }
+  /** POST /v1/withdrawal-requests (module_6469). */
+  createWithdrawalRequest(body: JsonRecord = {}, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>("/v1/withdrawal-requests", { method: "POST", body, signal });
+  }
+  /** PUT /v1/rooms/:roomId/user-plot-chat-profiles/:id/selected (module_4703). */
+  selectUserPlotChatProfile(roomId: string, id: string, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/rooms/${encodeURIComponent(roomId)}/user-plot-chat-profiles/${encodeURIComponent(id)}/selected`, { method: "PUT", signal });
+  }
+  /** POST /v1/rooms/:roomId/user-plot-chat-profiles/selected (module_4703). */
+  createAndSelectUserPlotChatProfile(roomId: string, body: JsonRecord, signal?: AbortSignal): Promise<JsonRecord> {
+    return this.request<JsonRecord>(`/v1/rooms/${encodeURIComponent(roomId)}/user-plot-chat-profiles/selected`, { method: "POST", body, signal });
+  }
+
+  /** Typed payload ({kind:"text"|"cyoa"|"plugin"}) is mapped to the wire body; a raw JsonRecord passes through verbatim. */
+  async *sendMessageStream(
+    roomId: string,
+    body: JsonRecord | SendMessagePayload,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamChunk> {
+    const wire = (body as SendMessagePayload).kind !== undefined
+      ? buildSendMessageBody(body as SendMessagePayload)
+      : (body as JsonRecord);
+    const res = await this.streamRequest(`/v1/rooms/${encodeURIComponent(roomId)}/messages/stream`, wire, signal);
+    yield* parseStreamChunks(res.body);
+  }
+
+  /** Body shape from room-UjsQENDl.js `regenerateMessage`. */
+  async *regenerateCandidateStream(
+    roomId: string,
+    messageId: string,
+    body: RegenerateMessageRequest = {},
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamChunk> {
+    const res = await this.streamRequest(
+      `/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}/candidates/stream`,
+      body,
+      signal,
+    );
+    yield* parseStreamChunks(res.body);
+  }
+}
