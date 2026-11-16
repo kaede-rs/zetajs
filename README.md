@@ -1,4 +1,5 @@
 # zetajs
+
 An unofficial client for zeta.
 
 [![技術者倫理 遵守済み](https://img.shields.io/badge/%E6%8A%80%E8%A1%93%E8%80%85%E5%80%AB%E7%90%86-%E9%81%B5%E5%AE%88%E6%B8%88%E3%81%BF-0a0a0a?style=for-the-badge&labelColor=ffffff)](https://技術者倫理.com)
@@ -31,9 +32,14 @@ const client = new ZetaClient({
 });
 const me = await client.getMe();
 const { rooms } = await client.listRooms();
-const room = await client.createRoom({ chatProfile: { type: "userChatProfileId", userChatProfileId: "…" } });
+const room = await client.createRoom({
+  chatProfile: { type: "userChatProfileId", userChatProfileId: "…" },
+});
 
-for await (const chunk of client.sendMessageStream(room.id as string, { kind: "text", text: "Hello, zeta!" })) {
+for await (const chunk of client.sendMessageStream(room.id as string, {
+  kind: "text",
+  text: "Hello, zeta!",
+})) {
   console.log(chunk.chunkMessage ?? chunk.replyMessage);
 }
 ```
@@ -47,11 +53,11 @@ You can log in directly against zeta's API.
 ```ts
 // Google / Apple / Kakao / Facebook / LINE — token from the platform SDK
 const tokens = await client.loginWithExternalToken({
-  token: idToken,              // Google idToken / Apple identityToken
+  token: idToken, // Google idToken / Apple identityToken
   issuer: "GOOGLE",
-  name: "Given Family",        // Apple only
+  name: "Given Family", // Apple only
 });
-// 404 → account not signed up: client.checkSignup({ token, issuer }) 
+// 404 → account not signed up: client.checkSignup({ token, issuer })
 // Internal/debug login: await client.loginInternal(username, password)
 ```
 
@@ -61,15 +67,15 @@ const tokens = await client.loginWithExternalToken({
 
 ## API Overview
 
-| Area | Methods |
-|---|---|
-| auth | `loginWithExternalToken`, `loginInternal`, `checkSignup`, `issueToken`, `refreshAccessToken`, `generateSsoCode`, `exchangeSsoAccessToken`, `getConnectedExternalPlatforms` |
-| users | `getMe`, `updateMe`, `getUser`, `getUserIdByUsername`, `logout`, `reportUser` |
-| rooms | `listRooms`, `listAllRooms`, `getRoom`, `createRoom`, `updateRoom`, `deleteRoom`, `pinRoom`, `unpinRoom`, `cloneRoom`, `purgeRooms`, `getActiveRoomId`, `getRoomPlotId` |
+| Area     | Methods                                                                                                                                                                                   |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| auth     | `loginWithExternalToken`, `loginInternal`, `checkSignup`, `issueToken`, `refreshAccessToken`, `generateSsoCode`, `exchangeSsoAccessToken`, `getConnectedExternalPlatforms`                |
+| users    | `getMe`, `updateMe`, `getUser`, `getUserIdByUsername`, `logout`, `reportUser`                                                                                                             |
+| rooms    | `listRooms`, `listAllRooms`, `getRoom`, `createRoom`, `updateRoom`, `deleteRoom`, `pinRoom`, `unpinRoom`, `cloneRoom`, `purgeRooms`, `getActiveRoomId`, `getRoomPlotId`                   |
 | messages | `listMessages` (cursors: `limit` / `cursor` / `prevCursor`), `updateMessage`, `confirmCandidate`, `editCandidate`, `deleteRoomMessages`, `sendMessageStream`, `regenerateCandidateStream` |
-| plots | `listPlots`, `listAllPlots`, `getPlot`, `createPlot`, `updatePlot`, `searchPlots` |
-| reports | `createPlotReport`, `createLorebookReport`, `createWithdrawalRequest`, `selectUserPlotChatProfile`, `createAndSelectUserPlotChatProfile` |
-| misc | `searchCreators`, `getCreatorStats`, `listNotifications`, `listChatProfiles`, `getCoinBalance` |
+| plots    | `listPlots`, `listAllPlots`, `getPlot`, `createPlot`, `updatePlot`, `searchPlots`                                                                                                         |
+| reports  | `createPlotReport`, `createLorebookReport`, `createWithdrawalRequest`, `selectUserPlotChatProfile`, `createAndSelectUserPlotChatProfile`                                                  |
+| misc     | `searchCreators`, `getCreatorStats`, `listNotifications`, `listChatProfiles`, `getCoinBalance`                                                                                            |
 
 For pagination, make the first request without a `page` parameter. For each following page, pass the returned `nextPage` as `page`, and stop once `nextPage` is null. `listAllRooms` / `listAllPlots` handle this loop for you.
 
@@ -78,4 +84,5 @@ For pagination, make the first request without a `page` parameter. For each foll
 Chat chunks have an `event` field (`IN_PROGRESS`, `CHAT_COMPLETE`, `CANDIDATE_COMPLETE`, `CHAT_OPTION_COMPLETE`, `RECOMMENDED_MESSAGE_COMPLETE`, and so on). Tell chunks apart by `event` first, then by which fields are present (`chunkMessage`, `replyMessage`, `candidate`, `replyOption`, `penalty`). There is no `type` field.
 
 ## Disclaimer
+
 This is unofficial, so you might get banned. The author takes no responsibility for whatever happens.

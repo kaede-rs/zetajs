@@ -17,7 +17,10 @@ export interface ZetaClientOptions {
   extraHeaders?: Record<string, string>;
   /** Injectable fetch for tests. Defaults to global fetch. */
   fetch?: typeof fetch;
-  onTokensRefreshed?: (tokens: { accessToken: string; refreshToken: string }) => void;
+  onTokensRefreshed?: (tokens: {
+    accessToken: string;
+    refreshToken: string;
+  }) => void;
 }
 
 export interface Tokens {
@@ -38,21 +41,35 @@ export type ChatSendMessageRequest =
   | { type: "PLUGIN"; pluginId: string; content: unknown };
 
 /** `cyoaType` is always "DIALOGUE" (gen-BT-d5in2.js). */
-export function buildSendMessageBody(payload: SendMessagePayload): ChatSendMessageRequest {
+export function buildSendMessageBody(
+  payload: SendMessagePayload,
+): ChatSendMessageRequest {
   switch (payload.kind) {
     case "cyoa":
-      return { type: "CYOA", title: payload.title, text: payload.text, cyoaType: "DIALOGUE" };
+      return {
+        type: "CYOA",
+        title: payload.title,
+        text: payload.text,
+        cyoaType: "DIALOGUE",
+      };
     case "plugin":
-      return { type: "PLUGIN", pluginId: payload.pluginId, content: payload.content };
+      return {
+        type: "PLUGIN",
+        pluginId: payload.pluginId,
+        content: payload.content,
+      };
     default:
-      return { type: "TEXT", text: payload.text, recommendedMessageId: payload.recommendedMessageId };
+      return {
+        type: "TEXT",
+        text: payload.text,
+        recommendedMessageId: payload.recommendedMessageId,
+      };
   }
 }
 
 /** PUT /v1/rooms/:roomId/messages/:messageId body (room-UjsQENDl.js `confirmCandidate`). */
 export type UpdateMessageRequest =
-  | { type: "CANDIDATE"; candidateId: string }
-  | JsonRecord;
+  { type: "CANDIDATE"; candidateId: string } | JsonRecord;
 
 export interface RegenerateMessageRequest {
   guidePrompt?: string;
@@ -62,7 +79,8 @@ export interface RegenerateMessageRequest {
 /** POST /v1/auth/tokens {type:"external"} body (module_4161:212). */
 export interface ExternalToken {
   token: string;
-  issuer: "GOOGLE" | "APPLE" | "KAKAO" | "FACEBOOK" | "LINE" | "INTERNAL_ACCESS";
+  issuer:
+    "GOOGLE" | "APPLE" | "KAKAO" | "FACEBOOK" | "LINE" | "INTERNAL_ACCESS";
   /** Apple only: givenName + familyName. */
   name?: string;
 }

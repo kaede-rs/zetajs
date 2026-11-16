@@ -1,7 +1,10 @@
 // Endpoint inventory — 400 entries over 331 unique paths, methods recovered by
 // decompiling the generated API-definition modules (hermes-decomp, HBC 98).
 // Stored as compact "METHOD path" strings; ENDPOINTS is built once at import.
-export interface Endpoint { method: string; path: string; }
+export interface Endpoint {
+  method: string;
+  path: string;
+}
 const SPECS: readonly string[] = [
   "GET /debug/dev-server",
   "GET /debug/dev-server/:serverName/logs",

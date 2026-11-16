@@ -4,20 +4,44 @@
 // (NotFound -> NOT_FOUND, Frame4cutEventClosed -> FRAME_4CUT_EVENT_CLOSED,
 // Zetto2InvalidVideoUrl -> ZETTO2_INVALID_VIDEO_URL). Verified against the
 // original 376-entry table: 0 mismatches.
-type IsLower<C extends string> = C extends Lowercase<C> ? (C extends Uppercase<C> ? false : true) : false;
-type IsUpper<C extends string> = C extends Uppercase<C> ? (C extends Lowercase<C> ? false : true) : false;
-type IsDigit<C extends string> = C extends "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ? true : false;
+type IsLower<C extends string> =
+  C extends Lowercase<C> ? (C extends Uppercase<C> ? false : true) : false;
+type IsUpper<C extends string> =
+  C extends Uppercase<C> ? (C extends Lowercase<C> ? false : true) : false;
+type IsDigit<C extends string> = C extends
+  "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+  ? true
+  : false;
 /** PascalCase -> SNAKE_CASE at type level; mirrors toExceptionCode below. */
-type SnakeCase<S extends string, Acc extends string = "", Prev extends string = ""> =
-  S extends `${infer C}${infer R}`
-    ? R extends `${infer N}${string}`
-      ? SnakeCase<R, `${Acc}${IsUpper<C> extends true
-          ? (Acc extends "" ? Uppercase<C> : (IsLower<Prev> extends true ? `_${Uppercase<C>}` : (IsDigit<Prev> extends true ? `_${Uppercase<C>}` : (IsLower<N> extends true ? `_${Uppercase<C>}` : Uppercase<C>))))
+type SnakeCase<
+  S extends string,
+  Acc extends string = "",
+  Prev extends string = "",
+> = S extends `${infer C}${infer R}`
+  ? R extends `${infer N}${string}`
+    ? SnakeCase<
+        R,
+        `${Acc}${IsUpper<C> extends true
+          ? Acc extends ""
+            ? Uppercase<C>
+            : IsLower<Prev> extends true
+              ? `_${Uppercase<C>}`
+              : IsDigit<Prev> extends true
+                ? `_${Uppercase<C>}`
+                : IsLower<N> extends true
+                  ? `_${Uppercase<C>}`
+                  : Uppercase<C>
           : IsDigit<C> extends true
-            ? (IsLower<Prev> extends true ? (IsLower<N> extends true ? `_${C}` : C) : C)
-            : Uppercase<C>}`, C>
-      : SnakeCase<R, `${Acc}${Uppercase<C>}`, C>
-    : Acc;
+            ? IsLower<Prev> extends true
+              ? IsLower<N> extends true
+                ? `_${C}`
+                : C
+              : C
+            : Uppercase<C>}`,
+        C
+      >
+    : SnakeCase<R, `${Acc}${Uppercase<C>}`, C>
+  : Acc;
 
 function toExceptionCode(key: string): string {
   return key
@@ -409,4 +433,5 @@ const CODE_KEYS = [
 export const ExceptionCode = Object.fromEntries(
   CODE_KEYS.map((k) => [k, toExceptionCode(k)]),
 ) as { readonly [K in (typeof CODE_KEYS)[number]]: SnakeCase<K> };
-export type ExceptionCodeValue = (typeof ExceptionCode)[keyof typeof ExceptionCode];
+export type ExceptionCodeValue =
+  (typeof ExceptionCode)[keyof typeof ExceptionCode];
