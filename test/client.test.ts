@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ENDPOINTS, ZetaClient, ZetaError, loginWithAccessToken } from "../src/index.ts";
+import { ENDPOINTS, ExceptionCode, ZetaClient, ZetaError, loginWithAccessToken } from "../src/index.ts";
 
 function mockFetch(calls: { url: string; init: unknown }[], body: unknown, status = 200): typeof fetch {
   return (async (url: unknown, init?: unknown) => {
@@ -220,5 +220,48 @@ describe("ZetaClient", () => {
     await client.listMessages("r1", { limit: 20, cursor: "abc" });
     expect(calls[0].url).toContain("limit=20");
     expect(calls[0].url).toContain("cursor=abc");
+  });
+
+  test("ExceptionCode values are derived verbatim, incl. digit keys", () => {
+    expect(ExceptionCode.NotFound).toBe("NOT_FOUND");
+    expect(ExceptionCode.AuthExpired).toBe("AUTH_EXPIRED");
+    expect(ExceptionCode.AppUpdateRequired).toBe("APP_UPDATE_REQUIRED");
+    expect(ExceptionCode.Frame4cutEventClosed).toBe("FRAME_4CUT_EVENT_CLOSED");
+    expect(ExceptionCode.Zetto2InvalidVideoUrl).toBe("ZETTO2_INVALID_VIDEO_URL");
+    expect(ExceptionCode.AnonymousBoardNotAPoll).toBe("ANONYMOUS_BOARD_NOT_A_POLL");
+    expect(Object.keys(ExceptionCode)).toHaveLength(376);
+  });
+
+  test("ENDPOINTS entries are {method, path} objects built from compact specs", () => {
+    expect(ENDPOINTS[0]).toEqual({ method: "GET", path: "/debug/dev-server" });
+    expect(new Set(ENDPOINTS.map((e) => e.path)).size).toBe(331);
+  });
+
+  test("stream parser handles events split mid-JSON across reads", async () => {
+    const enc = new TextEncoder();
+    const full = 'data: {"event":"IN_PROGRESS","chunkMessage":{"contents":[{"type":"TEXT","text":"hello"}]}}\n\n';
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        // split inside the JSON payload, and deliver two events in one read
+        c.enqueue(enc.encode(full.slice(0, 20)));
+        c.enqueue(enc.encode(full.slice(20) + full));
+        c.close();
+      },
+    });
+    const client = loginWithAccessToken("t", { fetch: (async () => new Response(stream, { status: 200 })) as unknown as typeof fetch });
+    const chunks = [];
+    for await (const ch of client.sendMessageStream("r1", { kind: "text", text: "hi" })) chunks.push(ch);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0].event).toBe("IN_PROGRESS");
+  });
+
+  test("streamRequest network failure throws ZetaError, not the raw error", async () => {
+    const fetchFn = (async () => {
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+    const client = loginWithAccessToken("t", { fetch: fetchFn });
+    await expect((async () => {
+      for await (const _ of client.sendMessageStream("r1", { kind: "text", text: "hi" })) { /* drain */ }
+    })()).rejects.toBeInstanceOf(ZetaError);
   });
 });

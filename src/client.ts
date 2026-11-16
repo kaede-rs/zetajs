@@ -74,17 +74,22 @@ function decodeJwtExp(token: string): number | null {
   try {
     const payload = token.split(".")[1];
     if (!payload) return null;
-    const json: unknown = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+    const json: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     return typeof (json as { exp?: unknown }).exp === "number" ? (json as { exp: number }).exp : null;
   } catch {
     return null;
   }
 }
 
-function toQuery(query: Record<string, unknown>): Record<string, string> {
-  const q: Record<string, string> = {};
-  for (const [k, v] of Object.entries(query)) if (v !== undefined) q[k] = String(v);
-  return q;
+/** Query string for one request; skips undefined, encodes keys and values. */
+function toQueryString(query: Record<string, unknown>): string {
+  let out = "";
+  for (const [k, v] of Object.entries(query)) {
+    if (v === undefined) continue;
+    if (out) out += "&";
+    out += `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`;
+  }
+  return out;
 }
 
 export class ZetaClient {
@@ -100,6 +105,10 @@ export class ZetaClient {
   private accessToken: string | undefined;
   private refreshToken: string | undefined;
   private refreshing: Promise<void> | null = null;
+  private jsonHeaders: Record<string, string> | null = null;
+  private streamHeaders: Record<string, string> | null = null;
+  private tokenExp: number | null = null;
+  private tokenExpFor: string | undefined;
 
   constructor(options: ZetaClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, "");
@@ -122,16 +131,24 @@ export class ZetaClient {
   setTokens(tokens: Tokens): void {
     this.accessToken = tokens.accessToken;
     this.refreshToken = tokens.refreshToken;
+    this.jsonHeaders = null;
+    this.streamHeaders = null;
   }
 
   setAccessToken(token: string): void {
     this.accessToken = token;
+    this.jsonHeaders = null;
+    this.streamHeaders = null;
   }
 
-  /** Headers the app sends (fn51718/fn52394). */
-  private headers(): Record<string, string> {
+  /** Headers the app sends (fn51718/fn52394). Built once per token; a caller
+   * mutating extraHeaders after construction still gets a fresh object. */
+  private headers(accept: "application/json" | "text/event-stream"): Record<string, string> {
+    const extra = Object.keys(this.extraHeaders).length > 0;
+    const cached = accept === "application/json" ? this.jsonHeaders : this.streamHeaders;
+    if (cached && !extra) return cached;
     const h: Record<string, string> = {
-      Accept: "application/json",
+      Accept: accept,
       "X-Client-Type": "app",
       "X-Device-Type": "android",
       "X-Client-Version": this.clientVersion,
@@ -142,13 +159,22 @@ export class ZetaClient {
     if (this.language) h["X-User-Language"] = this.language;
     if (this.accessToken) h.Authorization = `Bearer ${this.accessToken}`;
     if (this.apiKey) h["x-api-key"] = this.apiKey;
+    if (!extra) {
+      if (accept === "application/json") this.jsonHeaders = h;
+      else this.streamHeaders = h;
+    }
     return h;
   }
 
-  /** App rule (fn52394): refresh when jwt exp is within 30s. */
+  /** App rule (fn52394): refresh when jwt exp is within 30s. exp is decoded
+   * once per token string, not once per request. */
   private tokenExpiringSoon(): boolean {
     if (!this.accessToken || !this.refreshToken) return false;
-    const exp = decodeJwtExp(this.accessToken);
+    if (this.tokenExpFor !== this.accessToken) {
+      this.tokenExpFor = this.accessToken;
+      this.tokenExp = decodeJwtExp(this.accessToken);
+    }
+    const exp = this.tokenExp;
     return exp !== null && exp * 1000 - 30_000 < Date.now();
   }
 
@@ -159,7 +185,7 @@ export class ZetaClient {
       this.refreshing = (async () => {
         const res = await this.doFetch(`${this.baseUrl}/v1/auth/tokens`, {
           method: "POST",
-          headers: { ...this.headers(), "Content-Type": "application/json" },
+          headers: { ...this.headers("application/json"), "Content-Type": "application/json" },
           body: JSON.stringify({ deviceId: this.deviceId, type: "refresh", refreshToken: this.refreshToken }),
         });
         if (!res.ok) throw new ZetaError(`zeta ${res.status}: refresh`, res.status, await res.text().catch(() => ""));
@@ -177,17 +203,21 @@ export class ZetaClient {
 
   private async request<T>(
     path: string,
-    init: { method?: string; body?: unknown; query?: Record<string, string>; signal?: AbortSignal } = {},
+    init: { method?: string; body?: unknown; query?: Record<string, unknown>; signal?: AbortSignal } = {},
     retried = false,
   ): Promise<T> {
     if (this.tokenExpiringSoon()) await this.refreshAccessToken().catch(() => undefined);
-    const url = new URL(this.baseUrl + path);
-    for (const [k, v] of Object.entries(init.query ?? {})) url.searchParams.set(k, v);
+    const qs = init.query ? toQueryString(init.query) : "";
+    const url = qs ? `${this.baseUrl}${path}?${qs}` : this.baseUrl + path;
+    const headers =
+      init.body !== undefined
+        ? { ...this.headers("application/json"), "Content-Type": "application/json" }
+        : this.headers("application/json");
     let res: Response;
     try {
       res = await this.doFetch(url, {
         method: init.method ?? "GET",
-        headers: { ...this.headers(), ...(init.body !== undefined ? { "Content-Type": "application/json" } : {}) },
+        headers,
         body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
         signal: init.signal,
       });
@@ -225,12 +255,17 @@ export class ZetaClient {
     retried = false,
   ): Promise<Response> {
     if (this.tokenExpiringSoon()) await this.refreshAccessToken().catch(() => undefined);
-    const res = await this.doFetch(`${this.baseUrl}${path}`, {
-      method: "POST",
-      headers: { ...this.headers(), Accept: "text/event-stream", "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal,
-    });
+    let res: Response;
+    try {
+      res = await this.doFetch(`${this.baseUrl}${path}`, {
+        method: "POST",
+        headers: { ...this.headers("text/event-stream"), "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (cause) {
+      throw new ZetaError(`request failed: ${path}`, 0, String(cause));
+    }
     if (res.status === 401 && this.refreshToken && !retried) {
       try {
         await this.refreshAccessToken();
@@ -311,21 +346,29 @@ export class ZetaClient {
     return this.request<JsonRecord>(`/v1/users/${encodeURIComponent(userId)}/report`, { method: "POST", body, signal });
   }
 
-  listRooms(query: PageQuery = {}, signal?: AbortSignal): Promise<ListRoomsResponse> {
-    return this.request<ListRoomsResponse>("/v1/rooms", { query: toQuery(query), signal });
-  }
-  /** First call sends no page param, then page = previous nextPage until null. */
-  async listAllRooms(signal?: AbortSignal): Promise<RoomApiDto[]> {
-    const all: RoomApiDto[] = [];
+  /** Shared page/nextPage loop (first call sends no `page`). */
+  private async listAllPages<P extends Record<string, unknown>, T>(
+    fetchPage: (query: PageQuery) => Promise<P>,
+    pick: (page: P) => T[] | undefined,
+  ): Promise<T[]> {
+    const all: T[] = [];
     let page: number | string | undefined;
     for (;;) {
-      const res = await this.listRooms(page === undefined ? {} : { page }, signal);
-      all.push(...(res.rooms ?? []));
+      const res = await fetchPage(page === undefined ? {} : { page });
+      all.push(...(pick(res) ?? []));
       const next = (res as { nextPage?: unknown }).nextPage;
       if (next === null || next === undefined) break;
       page = next as number | string;
     }
     return all;
+  }
+
+  listRooms(query: PageQuery = {}, signal?: AbortSignal): Promise<ListRoomsResponse> {
+    return this.request<ListRoomsResponse>("/v1/rooms", { query, signal });
+  }
+  /** First call sends no page param, then page = previous nextPage until null. */
+  listAllRooms(signal?: AbortSignal): Promise<RoomApiDto[]> {
+    return this.listAllPages((q) => this.listRooms(q, signal), (r) => r.rooms);
   }
   getRoom(roomId: string, signal?: AbortSignal): Promise<RoomApiDto> {
     return this.request<RoomApiDto>(`/v1/rooms/${encodeURIComponent(roomId)}`, { signal });
@@ -363,7 +406,7 @@ export class ZetaClient {
     query: { limit?: number | string; cursor?: string; prevCursor?: string } = {},
     signal?: AbortSignal,
   ): Promise<ListMessageResponse> {
-    return this.request<ListMessageResponse>(`/v1/rooms/${encodeURIComponent(roomId)}/messages`, { query: toQuery(query), signal });
+    return this.request<ListMessageResponse>(`/v1/rooms/${encodeURIComponent(roomId)}/messages`, { query, signal });
   }
   updateMessage(roomId: string, messageId: string, body: UpdateMessageRequest, signal?: AbortSignal): Promise<JsonRecord> {
     return this.request<JsonRecord>(`/v1/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`, { method: "PUT", body, signal });
@@ -388,19 +431,10 @@ export class ZetaClient {
   }
 
   listPlots(query: PageQuery = {}, signal?: AbortSignal): Promise<PagePlotResponse> {
-    return this.request<PagePlotResponse>("/v1/plots", { query: toQuery(query), signal });
+    return this.request<PagePlotResponse>("/v1/plots", { query, signal });
   }
-  async listAllPlots(signal?: AbortSignal): Promise<PlotApiDto[]> {
-    const all: PlotApiDto[] = [];
-    let page: number | string | undefined;
-    for (;;) {
-      const res = await this.listPlots(page === undefined ? {} : { page }, signal);
-      all.push(...(res.plots ?? []));
-      const next = (res as { nextPage?: unknown }).nextPage;
-      if (next === null || next === undefined) break;
-      page = next as number | string;
-    }
-    return all;
+  listAllPlots(signal?: AbortSignal): Promise<PlotApiDto[]> {
+    return this.listAllPages((q) => this.listPlots(q, signal), (r) => r.plots);
   }
   getPlot(plotId: string, signal?: AbortSignal): Promise<DetailedPlotApiDto> {
     return this.request<DetailedPlotApiDto>(`/v1/plots/${encodeURIComponent(plotId)}`, { signal });
