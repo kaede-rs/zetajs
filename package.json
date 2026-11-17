@@ -15,8 +15,7 @@
   "name": "zetajs",
   "private": true,
   "scripts": {
-    "check": "bun check && bun fmt",
-    "test": "bun test"
+    "check": "bun check && bun fmt"
   },
   "type": "module",
   "types": "src/index.ts",
