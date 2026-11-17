@@ -8,31 +8,66 @@ export async function* parseStreamChunks(
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  let start = 0; // offset of the first unprocessed byte; buf is only compacted past 64KB
+  let start = 0; // offset of the first unprocessed byte
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
-      let idx = buf.indexOf("\n\n", start);
-      while (idx >= 0) {
-        yield* parseEvent(buf.slice(start, idx));
-        start = idx + 2;
-        idx = buf.indexOf("\n\n", start);
+      // H4 fix: normalize CRLF -> LF. A lone trailing \r is left in place so
+      // a \r\n split across reads still normalizes on the next append.
+      buf = buf.replace(/\r\n/g, "\n");
+      let b = findBoundary(buf, start);
+      while (b !== null) {
+        yield* parseEvent(buf.slice(start, b.end));
+        start = b.next;
+        b = findBoundary(buf, start);
       }
       // Compact once per read: only the trailing partial event stays, so the
-      // next append never copies already-consumed bytes (old code re-sliced
-      // after every event; never compacting re-copies the whole prefix).
+      // next append never copies already-consumed bytes.
       if (start > 0) {
         buf = buf.slice(start);
         start = 0;
       }
     }
     buf += decoder.decode();
+    buf = buf.replace(/\r/g, "\n");
     if (start < buf.length) yield* parseEvent(buf.slice(start));
   } finally {
     reader.releaseLock();
   }
+}
+
+/**
+ * Next event boundary at or after `start`, or null if the buffer holds only
+ * a partial event. Two forms:
+ * - SSE: a blank line (`\n\n`) ends the event.
+ * - NDJSON (H5 fix): a bare JSON line ending in a single `\n` is its own
+ *   event, so it streams before EOF instead of waiting for a blank line.
+ *   Lines starting with `data:` / `:` / `event:` are SSE, not NDJSON.
+ */
+function findBoundary(
+  buf: string,
+  start: number,
+): { end: number; next: number } | null {
+  const dbl = buf.indexOf("\n\n", start);
+  const nl = buf.indexOf("\n", start);
+  if (nl >= 0 && (dbl < 0 || nl < dbl)) {
+    const line = buf.slice(start, nl).trim();
+    if (
+      (line.startsWith("{") && line.endsWith("}")) ||
+      (line.startsWith("[") && line.endsWith("]"))
+    ) {
+      try {
+        JSON.parse(line);
+        return { end: nl, next: nl + 1 };
+      } catch {
+        // Incomplete / invalid JSON: wait for more data.
+      }
+    }
+  }
+  if (dbl >= 0) return { end: dbl, next: dbl + 2 };
+  return null;
 }
 
 function* parseEvent(event: string): Generator<Record<string, unknown>> {
