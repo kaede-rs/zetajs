@@ -6,6 +6,7 @@ import {
   ZetaError,
   loginWithAccessToken,
 } from "../src/index.ts";
+import { parseStreamChunks } from "../src/stream.ts";
 
 function mockFetch(
   calls: { url: string; init: unknown }[],
@@ -421,5 +422,112 @@ describe("ZetaClient", () => {
         }
       })(),
     ).rejects.toBeInstanceOf(ZetaError);
+  });
+
+  test("C1: refresh without newRefreshToken keeps the old refresh token", async () => {
+    const fetchFn = (async (url: unknown) => {
+      if (String(url).endsWith("/v1/auth/tokens")) {
+        return new Response(JSON.stringify({ newAccessToken: "new-tok" }), {
+          status: 200,
+        });
+      }
+      return new Response(JSON.stringify({ id: "me" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const client = new ZetaClient({ fetch: fetchFn, deviceId: "dev-1" });
+    client.setTokens({ accessToken: expiredJwt(), refreshToken: "old-ref" });
+    await client.getMe();
+    expect(client.token).toBe("new-tok");
+    // Second expiry must still be able to refresh (old token preserved).
+    const tokens = await client.refreshAccessToken();
+    expect(tokens.refreshToken).toBe("old-ref");
+  });
+
+  test("H1: failed refresh runs once per request, not 3 times", async () => {
+    let refreshCalls = 0;
+    let meCalls = 0;
+    const fetchFn = (async (url: unknown) => {
+      if (String(url).endsWith("/v1/auth/tokens")) {
+        refreshCalls += 1;
+        return new Response(JSON.stringify({ code: "AUTH_EXPIRED" }), {
+          status: 401,
+        });
+      }
+      meCalls += 1;
+      return new Response(JSON.stringify({ code: "AUTH_EXPIRED" }), {
+        status: 401,
+      });
+    }) as unknown as typeof fetch;
+    const client = new ZetaClient({ fetch: fetchFn });
+    client.setTokens({ accessToken: expiredJwt(), refreshToken: "old-ref" });
+    await expect(client.getMe()).rejects.toBeInstanceOf(ZetaError);
+    expect(refreshCalls).toBe(1);
+    expect(meCalls).toBe(1);
+  });
+
+  test("H2: listAllRooms rejects on a repeated nextPage instead of looping", async () => {
+    const fetchFn = (async () =>
+      new Response(JSON.stringify({ rooms: [{ id: "r1" }], nextPage: 2 }), {
+        status: 200,
+      })) as unknown as typeof fetch;
+    const client = new ZetaClient({ fetch: fetchFn });
+    await expect(client.listAllRooms()).rejects.toThrow(/repeated nextPage/);
+  });
+
+  test("H3: logout clears local tokens", async () => {
+    const client = loginWithAccessToken("t", {
+      fetch: mockFetch([], {}),
+    });
+    client.setTokens({ accessToken: "a1", refreshToken: "r1" });
+    await client.logout();
+    expect(client.token).toBeUndefined();
+    client.setTokens({ accessToken: "a1", refreshToken: "r1" });
+    client.clearTokens();
+    expect(client.token).toBeUndefined();
+  });
+
+  test("H4: CRLF SSE streams before close", async () => {
+    let controller: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    const it = parseStreamChunks(stream)[Symbol.asyncIterator]();
+    const first = it.next();
+    controller!.enqueue(
+      new TextEncoder().encode('data: {"event":"A"}\r\n\r\n'),
+    );
+    const chunk = await Promise.race([
+      first,
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("timed out before close")), 1000),
+      ),
+    ]);
+    expect(
+      (chunk as IteratorResult<Record<string, unknown>>).value?.event,
+    ).toBe("A");
+    controller!.close();
+  });
+
+  test("H5: NDJSON lines stream before close", async () => {
+    let controller: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    const it = parseStreamChunks(stream)[Symbol.asyncIterator]();
+    const first = it.next();
+    controller!.enqueue(new TextEncoder().encode('{"event":"B"}\n'));
+    const chunk = await Promise.race([
+      first,
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("timed out before close")), 1000),
+      ),
+    ]);
+    expect(
+      (chunk as IteratorResult<Record<string, unknown>>).value?.event,
+    ).toBe("B");
+    controller!.close();
   });
 });

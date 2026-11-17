@@ -151,6 +151,16 @@ export class ZetaClient {
     this.streamHeaders = null;
   }
 
+  /** Clears local tokens + cached headers/exp (C1/H3 fix: logout must do this). */
+  clearTokens(): void {
+    this.accessToken = undefined;
+    this.refreshToken = undefined;
+    this.jsonHeaders = null;
+    this.streamHeaders = null;
+    this.tokenExp = null;
+    this.tokenExpFor = undefined;
+  }
+
   setAccessToken(token: string): void {
     this.accessToken = token;
     this.jsonHeaders = null;
@@ -201,6 +211,8 @@ export class ZetaClient {
   async refreshAccessToken(): Promise<Tokens> {
     if (!this.refreshToken) throw new ZetaError("no refresh token stored", 0);
     if (!this.refreshing) {
+      // C1 fix: keep the old refresh token if the server omits newRefreshToken.
+      const oldRefreshToken = this.refreshToken;
       this.refreshing = (async () => {
         const res = await this.doFetch(`${this.baseUrl}/v1/auth/tokens`, {
           method: "POST",
@@ -220,9 +232,12 @@ export class ZetaClient {
             res.status,
             await res.text().catch(() => ""),
           );
-        const tokens = parseTokens(await res.json());
-        if (!tokens)
+        const parsed = parseTokens(await res.json());
+        if (!parsed)
           throw new ZetaError("refresh returned no access token", res.status);
+        const tokens: Tokens = parsed.refreshToken
+          ? parsed
+          : { ...parsed, refreshToken: oldRefreshToken };
         this.setTokens(tokens);
         this.onTokensRefreshed?.(tokens);
       })().finally(() => {
@@ -245,9 +260,14 @@ export class ZetaClient {
       signal?: AbortSignal;
     } = {},
     retried = false,
+    // H1 fix: one refresh attempt per request. Pre-refresh and 401-refresh
+    // must not both run (and the retry must not pre-refresh again).
+    refreshTried = false,
   ): Promise<T> {
-    if (this.tokenExpiringSoon())
+    if (!refreshTried && this.tokenExpiringSoon()) {
+      refreshTried = true;
       await this.refreshAccessToken().catch(() => undefined);
+    }
     const qs = init.query ? toQueryString(init.query) : "";
     const url = qs ? `${this.baseUrl}${path}?${qs}` : this.baseUrl + path;
     const headers =
@@ -268,13 +288,18 @@ export class ZetaClient {
     } catch (cause) {
       throw new ZetaError(`request failed: ${path}`, 0, String(cause));
     }
-    if (res.status === 401 && this.refreshToken && !retried) {
+    if (res.status === 401 && this.refreshToken && !retried && !refreshTried) {
+      refreshTried = true;
+      let refreshed = false;
       try {
         await this.refreshAccessToken();
+        refreshed = true;
       } catch {
-        // fall through to the 401 error below
+        // Refresh failed: fall through to the 401 error below instead of
+        // retrying with the known-expired token.
       }
-      if (this.accessToken) return this.request<T>(path, init, true);
+      if (refreshed && this.accessToken)
+        return this.request<T>(path, init, true, refreshTried);
     }
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -304,9 +329,13 @@ export class ZetaClient {
     body: unknown,
     signal?: AbortSignal,
     retried = false,
+    // H1 fix: see request().
+    refreshTried = false,
   ): Promise<Response> {
-    if (this.tokenExpiringSoon())
+    if (!refreshTried && this.tokenExpiringSoon()) {
+      refreshTried = true;
       await this.refreshAccessToken().catch(() => undefined);
+    }
     let res: Response;
     try {
       res = await this.doFetch(`${this.baseUrl}${path}`, {
@@ -321,13 +350,17 @@ export class ZetaClient {
     } catch (cause) {
       throw new ZetaError(`request failed: ${path}`, 0, String(cause));
     }
-    if (res.status === 401 && this.refreshToken && !retried) {
+    if (res.status === 401 && this.refreshToken && !retried && !refreshTried) {
+      refreshTried = true;
+      let refreshed = false;
       try {
         await this.refreshAccessToken();
+        refreshed = true;
       } catch {
-        // fall through to the 401 error below
+        // Refresh failed: fall through to the 401 error below.
       }
-      if (this.accessToken) return this.streamRequest(path, body, signal, true);
+      if (refreshed && this.accessToken)
+        return this.streamRequest(path, body, signal, true, refreshTried);
     }
     if (!res.ok)
       throw new ZetaError(
@@ -445,11 +478,14 @@ export class ZetaClient {
       { signal },
     );
   }
-  logout(signal?: AbortSignal): Promise<JsonRecord> {
-    return this.request<JsonRecord>("/v1/users/logout", {
+  // H3 fix: logout clears local tokens; otherwise the client keeps using them.
+  async logout(signal?: AbortSignal): Promise<JsonRecord> {
+    const res = await this.request<JsonRecord>("/v1/users/logout", {
       method: "POST",
       signal,
     });
+    this.clearTokens();
+    return res;
   }
   reportUser(
     userId: string,
@@ -467,14 +503,29 @@ export class ZetaClient {
     fetchPage: (query: PageQuery) => Promise<P>,
     pick: (page: P) => T[] | undefined,
   ): Promise<T[]> {
+    // H2 fix: bound the loop. A server repeating the same nextPage (or an
+    // invalid one) previously looped forever and grew `all` without limit.
+    const MAX_PAGES = 100;
+    const seen = new Set<string>();
     const all: T[] = [];
     let page: number | string | undefined;
-    for (;;) {
+    for (let n = 0; ; n++) {
+      if (n >= MAX_PAGES)
+        throw new ZetaError(`listAllPages: too many pages (>${MAX_PAGES})`, 0);
       const res = await fetchPage(page === undefined ? {} : { page });
       all.push(...(pick(res) ?? []));
       const next = (res as { nextPage?: unknown }).nextPage;
       if (next === null || next === undefined) break;
-      page = next as number | string;
+      if ((typeof next !== "number" && typeof next !== "string") || next === "")
+        throw new ZetaError(
+          `listAllPages: invalid nextPage: ${String(next)}`,
+          0,
+        );
+      const key = String(next);
+      if (seen.has(key))
+        throw new ZetaError(`listAllPages: repeated nextPage: ${key}`, 0);
+      seen.add(key);
+      page = next;
     }
     return all;
   }
